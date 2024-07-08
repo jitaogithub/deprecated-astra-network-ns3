@@ -81,7 +81,7 @@ uint32_t enable_trace = 1;
 
 uint32_t buffer_size = 16;
 
-uint32_t qlen_dump_interval = 1000, qlen_mon_interval = 100;
+uint32_t qlen_dump_interval = 1000, qlen_mon_interval = 5000;
 uint64_t qlen_mon_start = 0, qlen_mon_end = 2100000000;
 string qlen_mon_file;
 
@@ -112,10 +112,11 @@ struct Interface {
 
   Interface() : idx(0), up(false) {}
 };
-map<Ptr<Node>, map<Ptr<Node>, Interface>> nbr2if;
+map<Ptr<Node>, map<Ptr<Node>, vector<Interface>>> nbr2if;
 // Mapping destination to next hop for each node: <node, <dest, <nexthop0, ...>
 // > >
 map<Ptr<Node>, map<Ptr<Node>, vector<Ptr<Node>>>> nextHop;
+map<Ptr<Node>, map<Ptr<Node>, uint64_t>> pairDis;
 map<Ptr<Node>, map<Ptr<Node>, uint64_t>> pairDelay;
 map<Ptr<Node>, map<Ptr<Node>, uint64_t>> pairTxDelay;
 map<uint32_t, map<uint32_t, uint64_t>> pairBw;
@@ -173,7 +174,7 @@ void monitor_buffer(FILE *qlen_output, NodeContainer *n) {
         //	vector<uint32_t> v;
         //	queue_result[i][j] = v;
         // }
-        if (size >= 1000) {
+        if (size > 1000) {
           queue_result[i][j] = size; // .push_back(size);
           if (test == 0) {
             test = 1;
@@ -183,11 +184,20 @@ void monitor_buffer(FILE *qlen_output, NodeContainer *n) {
           // if(j==1){
           // fprintf(qlen_output, "t %lu %u j %u %u ",
           // Simulator::Now().GetTimeStep(), i, j, size);
+          Ptr<ns3::Channel> c = sw->GetDevice(j)->GetChannel();
+          uint32_t gid = UINT32_MAX;
+          for (uint32_t k = 0; k < c->GetNDevices(); k++) {
+            uint32_t dst_nid = c->GetDevice(k)->GetNode()->GetId();
+            if (dst_nid != i) {
+              gid = dst_nid;
+              break;
+            }
+          }
           if (j < sw->GetNDevices() - 1) {
             test = 2;
-            fprintf(qlen_output, "j %u %u ", j, size);
+            fprintf(qlen_output, "j %u %u ", gid, size);
           } else if (j == sw->GetNDevices() - 1) {
-            fprintf(qlen_output, "j %u %u\n", j, size);
+            fprintf(qlen_output, "j %u %u\n", gid, size);
             test = 3;
           }
         }
@@ -206,6 +216,8 @@ void monitor_buffer(FILE *qlen_output, NodeContainer *n) {
   Simulator::Schedule(NanoSeconds(qlen_mon_interval), &monitor_buffer,
                       qlen_output, n);
 }
+
+extern map<uint32_t, map<uint32_t, uint64_t>> rdmaHwPairBw;
 
 void CalculateRoute(Ptr<Node> host) {
   // queue for the BFS.
@@ -226,21 +238,23 @@ void CalculateRoute(Ptr<Node> host) {
     Ptr<Node> now = q[i];
     int d = dis[now];
     for (auto it = nbr2if[now].begin(); it != nbr2if[now].end(); it++) {
-      // skip down link
-      if (!it->second.up)
-        continue;
-      Ptr<Node> next = it->first;
-      if (dis.find(next) == dis.end()) {
-        dis[next] = d + 1;
-        delay[next] = delay[now] + it->second.delay;
-        txDelay[next] = txDelay[now] +
-                        packet_payload_size * 1000000000lu * 8 / it->second.bw;
-        bw[next] = std::min(bw[now], it->second.bw);
-        if (next->GetNodeType() == 1)
-          q.push_back(next);
-      }
-      if (d + 1 == dis[next]) {
-        nextHop[next][host].push_back(now);
+      for (auto& iface: it->second) {
+        // skip down link
+        if (!iface.up)
+          continue;
+        Ptr<Node> next = it->first;
+        if (dis.find(next) == dis.end()) {
+          dis[next] = d + 1;
+          delay[next] = delay[now] + iface.delay;
+          txDelay[next] = txDelay[now] +
+                          packet_payload_size * 1000000000lu * 8 / iface.bw;
+          bw[next] = std::min(bw[now], iface.bw);
+          if (next->GetNodeType() == 1)
+            q.push_back(next);
+        }
+        if (d + 1 == dis[next]) {
+          nextHop[next][host].push_back(now);
+        }
       }
     }
   }
@@ -256,6 +270,7 @@ void CalculateRoute(Ptr<Node> host) {
     // host->GetId() << " bw " << it.second << std::endl;
     pairBw[it.first->GetId()][host->GetId()] = it.second;
   }
+  rdmaHwPairBw = pairBw;
 }
 
 void CalculateRoutes(NodeContainer &n) {
@@ -276,12 +291,14 @@ void SetRoutingEntries() {
       vector<Ptr<Node>> nexts = j->second;
       for (int k = 0; k < (int)nexts.size(); k++) {
         Ptr<Node> next = nexts[k];
-        uint32_t interface = nbr2if[node][next].idx;
-        if (node->GetNodeType() == 1)
-          DynamicCast<SwitchNode>(node)->AddTableEntry(dstAddr, interface);
-        else {
-          node->GetObject<RdmaDriver>()->m_rdma->AddTableEntry(dstAddr,
-                                                               interface);
+        for (auto& iface: nbr2if[node][next]) {
+          uint32_t interface = iface.idx;
+          if (node->GetNodeType() == 1)
+            DynamicCast<SwitchNode>(node)->AddTableEntry(dstAddr, interface);
+          else {
+            node->GetObject<RdmaDriver>()->m_rdma->AddTableEntry(dstAddr,
+                                                                interface);
+          }
         }
       }
     }
@@ -289,11 +306,11 @@ void SetRoutingEntries() {
 }
 
 // take down the link between a and b, and redo the routing
-void TakeDownLink(NodeContainer n, Ptr<Node> a, Ptr<Node> b) {
-  if (!nbr2if[a][b].up)
+void TakeDownLink(NodeContainer n, Ptr<Node> a, Ptr<Node> b, uint32_t link_idx) {
+  if (!nbr2if[a][b][link_idx].up)
     return;
   // take down link between a and b
-  nbr2if[a][b].up = nbr2if[b][a].up = false;
+  nbr2if[a][b][link_idx].up = nbr2if[b][a][link_idx].up = false;
   nextHop.clear();
   CalculateRoutes(n);
   // clear routing tables
@@ -303,8 +320,8 @@ void TakeDownLink(NodeContainer n, Ptr<Node> a, Ptr<Node> b) {
     else
       n.Get(i)->GetObject<RdmaDriver>()->m_rdma->ClearTable();
   }
-  DynamicCast<QbbNetDevice>(a->GetDevice(nbr2if[a][b].idx))->TakeDown();
-  DynamicCast<QbbNetDevice>(b->GetDevice(nbr2if[b][a].idx))->TakeDown();
+  DynamicCast<QbbNetDevice>(a->GetDevice(nbr2if[a][b][link_idx].idx))->TakeDown();
+  DynamicCast<QbbNetDevice>(b->GetDevice(nbr2if[b][a][link_idx].idx))->TakeDown();
   // reset routing table
   SetRoutingEntries();
 
@@ -313,6 +330,10 @@ void TakeDownLink(NodeContainer n, Ptr<Node> a, Ptr<Node> b) {
     if (n.Get(i)->GetNodeType() == 0)
       n.Get(i)->GetObject<RdmaDriver>()->m_rdma->RedistributeQp();
   }
+}
+
+void TakeDownLink(NodeContainer n, Ptr<Node> a, Ptr<Node> b) {
+  TakeDownLink(n, a, b, 0);
 }
 
 uint64_t get_nic_rate(NodeContainer &n) {
@@ -398,9 +419,6 @@ bool ReadConf(int argc, char *argv[]) {
         std::string v;
         conf >> v;
         trace_output_file = v;
-        if (argc > 2) {
-          trace_output_file = trace_output_file + std::string(argv[2]);
-        }
       } else if (key.compare("SIMULATOR_STOP_TIME") == 0) {
         double v;
         conf >> v;
@@ -619,11 +637,23 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
 
   QbbHelper qbb;
   Ipv4AddressHelper ipv4;
+  std::string line;
+  std::getline(topof, line);
   for (uint32_t i = 0; i < link_num; i++) {
+    if (!std::getline(topof, line)) {
+      printf("WARNING: Fewer links read than specified link num!\n");
+      break;
+    }
     uint32_t src, dst;
-    std::string data_rate, link_delay;
+    char data_rate[16];
+    char link_delay[16];
     double error_rate;
-    topof >> src >> dst >> data_rate >> link_delay >> error_rate;
+    int nfields = sscanf(line.c_str(), "%u %u %s %s %lf",
+      &src, &dst, data_rate, link_delay, &error_rate);
+    if (nfields < 5) {
+      printf("WARNING: Read fewer than 5 fields in link definition \"%s\"!", line.c_str());
+    }
+    // topof >> src >> dst >> data_rate >> link_delay >> error_rate;
     Ptr<Node> snode = n.Get(src), dnode = n.Get(dst);
 
     qbb.SetDeviceAttribute("DataRate", StringValue(data_rate));
@@ -663,26 +693,27 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
     }
 
     // used to create a graph of the topology
-    nbr2if[snode][dnode].idx =
-        DynamicCast<QbbNetDevice>(d.Get(0))->GetIfIndex();
-    nbr2if[snode][dnode].up = true;
-    nbr2if[snode][dnode].delay =
+    Interface local_if, remote_if;
+    local_if.idx = DynamicCast<QbbNetDevice>(d.Get(0))->GetIfIndex();
+    local_if.up = true;
+    local_if.delay = 
         DynamicCast<QbbChannel>(
             DynamicCast<QbbNetDevice>(d.Get(0))->GetChannel())
             ->GetDelay()
             .GetTimeStep();
-    nbr2if[snode][dnode].bw =
+    local_if.bw =
         DynamicCast<QbbNetDevice>(d.Get(0))->GetDataRate().GetBitRate();
-    nbr2if[dnode][snode].idx =
-        DynamicCast<QbbNetDevice>(d.Get(1))->GetIfIndex();
-    nbr2if[dnode][snode].up = true;
-    nbr2if[dnode][snode].delay =
+    remote_if.idx = DynamicCast<QbbNetDevice>(d.Get(1))->GetIfIndex();
+    remote_if.up = true;
+    remote_if.delay = 
         DynamicCast<QbbChannel>(
             DynamicCast<QbbNetDevice>(d.Get(1))->GetChannel())
             ->GetDelay()
             .GetTimeStep();
-    nbr2if[dnode][snode].bw =
+    remote_if.bw =
         DynamicCast<QbbNetDevice>(d.Get(1))->GetDataRate().GetBitRate();
+    nbr2if[snode][dnode].push_back(local_if);
+    nbr2if[dnode][snode].push_back(remote_if);
 
     // This is just to set up the connectivity between nodes. The IP addresses
     // are useless
@@ -862,13 +893,15 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
     SimSetting sim_setting;
     for (auto i : nbr2if) {
       for (auto j : i.second) {
-        uint16_t node = i.first->GetId();
-        uint8_t intf = j.second.idx;
-        uint64_t bps =
-            DynamicCast<QbbNetDevice>(i.first->GetDevice(j.second.idx))
-                ->GetDataRate()
-                .GetBitRate();
-        sim_setting.port_speed[node][intf] = bps;
+        for (auto& k : j.second) {
+          uint16_t node = i.first->GetId();
+          uint8_t intf = k.idx;
+          uint64_t bps =
+              DynamicCast<QbbNetDevice>(i.first->GetDevice(k.idx))
+                  ->GetDataRate()
+                  .GetBitRate();
+          sim_setting.port_speed[node][intf] = bps;
+        }
       }
     }
     sim_setting.win = maxBdp;
@@ -901,7 +934,9 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
   }
 
   // schedule buffer monitor
-  FILE *qlen_output = fopen(qlen_mon_file.c_str(), "w");
-  Simulator::Schedule(NanoSeconds(qlen_mon_start), &monitor_buffer, qlen_output,
-                      &n);
+  if (!qlen_mon_file.empty()) {
+    FILE *qlen_output = fopen(qlen_mon_file.c_str(), "w");
+    Simulator::Schedule(NanoSeconds(qlen_mon_start), &monitor_buffer, qlen_output,
+                        &n);
+  }
 }
